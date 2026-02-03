@@ -6,6 +6,7 @@ import pytest
 
 from weather_events.models.recommendation import GearItem
 from weather_events.models.weather import (
+    AstronomicalData,
     CloudCover,
     HourlyForecast,
     Precipitation,

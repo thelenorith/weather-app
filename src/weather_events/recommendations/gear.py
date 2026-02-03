@@ -199,11 +199,19 @@ class GearRecommender:
             items.append(rule.item)
             used_categories.add(category)
 
+        # Organize by category
+        by_category: dict[str, list[GearItem]] = {}
+        for item in items:
+            if item.category not in by_category:
+                by_category[item.category] = []
+            by_category[item.category].append(item)
+
         # Build the recommendation
         recommendation = GearRecommendation(
             activity=activity_name,
             conditions_summary=_build_conditions_summary(forecast),
             items=items,
+            by_category=by_category,
             temperature_c=forecast.temperature_c,
             feels_like_c=forecast.feels_like_c,
             wind_speed_ms=forecast.wind.speed_ms if forecast.wind else None,
@@ -213,10 +221,6 @@ class GearRecommender:
                 else None
             ),
         )
-
-        # Organize by category
-        for item in items:
-            recommendation.add_item(item)
 
         # Add notes based on conditions
         if forecast.precipitation and forecast.precipitation.probability_percent > 50:
