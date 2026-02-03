@@ -11,7 +11,7 @@ SRC_DIR = src
 TEST_DIR = tests
 
 # Default target runs all quality checks
-default: format lint typecheck test coverage
+default: format lint coverage test typecheck
 
 ## Installation targets
 install:
