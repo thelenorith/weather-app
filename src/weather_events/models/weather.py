@@ -151,6 +151,66 @@ class ConditionFlags(BaseModel):
         return self.is_rain or self.is_thunderstorm or self.is_snow
 
 
+class SunEffectConfig(BaseModel):
+    """Configuration for sun warming effect in relative temperature calculation.
+
+    The sun's warming effect depends on its altitude angle. At low angles
+    (winter, early morning, late afternoon), the sun has less warming effect.
+    Additionally, obstructions like trees and buildings can block low-angle sun.
+
+    The effect is linearly interpolated between min and max altitude thresholds.
+
+    Example configurations:
+        - Open field: min_altitude_zero=0, min_altitude_full=45
+        - Wooded trail: min_altitude_zero=15, min_altitude_full=50
+        - Urban canyon: min_altitude_zero=25, min_altitude_full=60
+    """
+
+    min_altitude_zero_effect: float = Field(
+        default=10.0,
+        description="Sun altitude (degrees) at or below which sun has zero warming effect. "
+        "Accounts for horizon obstructions like trees/buildings.",
+    )
+    min_altitude_full_effect: float = Field(
+        default=45.0,
+        description="Sun altitude (degrees) at or above which sun has full warming effect. "
+        "Higher sun = more direct rays = more warming.",
+    )
+    min_effect_when_visible: float = Field(
+        default=0.0,
+        description="Minimum warming effect (°F) when sun is above zero-effect altitude. "
+        "Set > 0 if you want some warming whenever sun is visible.",
+    )
+
+    def calculate_sun_factor(self, sun_altitude_deg: float | None) -> float:
+        """Calculate sun effect factor (0.0 to 1.0) based on altitude.
+
+        Args:
+            sun_altitude_deg: Sun altitude in degrees (None = assume full effect)
+
+        Returns:
+            Factor from 0.0 (no sun effect) to 1.0 (full sun effect)
+        """
+        if sun_altitude_deg is None:
+            # No altitude data - assume full effect (backward compatible)
+            return 1.0
+
+        if sun_altitude_deg <= self.min_altitude_zero_effect:
+            return 0.0
+
+        if sun_altitude_deg >= self.min_altitude_full_effect:
+            return 1.0
+
+        # Linear interpolation between thresholds
+        range_deg = self.min_altitude_full_effect - self.min_altitude_zero_effect
+        above_min = sun_altitude_deg - self.min_altitude_zero_effect
+        return above_min / range_deg
+
+
+# Default sun effect configuration
+DEFAULT_SUN_EFFECT_CONFIG = SunEffectConfig()
+
+
 class CloudCover(BaseModel):
     """Cloud cover information."""
 
@@ -414,6 +474,7 @@ class HourlyForecast(BaseModel):
     def get_relative_temperature_f(
         self,
         time_of_day: TimeOfDay | None = None,
+        sun_config: SunEffectConfig | None = None,
     ) -> float:
         """Calculate relative/perceived temperature in Fahrenheit.
 
@@ -421,12 +482,14 @@ class HourlyForecast(BaseModel):
         - Precipitation effect (getting wet makes you colder)
         - Wind chill (each mph reduces perceived temp)
         - Sun exposure (being in sun during day warms you up)
+        - Sun altitude (low-angle sun has reduced warming effect)
 
         This differs from "feels like" which only accounts for wind chill
         and humidity. Relative temperature is more useful for activity planning.
 
         Args:
             time_of_day: Override time of day (auto-detected if None)
+            sun_config: Configuration for sun altitude effect (uses defaults if None)
 
         Returns:
             Relative temperature in Fahrenheit
@@ -435,6 +498,7 @@ class HourlyForecast(BaseModel):
         conditions = self.get_condition_flags()
         tod = time_of_day or self.get_time_of_day()
         wind_mph = self.wind.speed_mph if self.wind else 0
+        config = sun_config or DEFAULT_SUN_EFFECT_CONFIG
 
         # Start with actual temperature
         relative_temp_f = temp_f
@@ -463,32 +527,54 @@ class HourlyForecast(BaseModel):
 
         # Sun exposure adjustment (only if not wet)
         if not conditions.is_wet():
+            # Determine base sun warming effect based on time of day and clouds
+            base_sun_effect = 0.0
+
             if tod == TimeOfDay.DAY:
                 if conditions.is_cloudy:
                     if conditions.is_light:  # partly cloudy
-                        relative_temp_f += 5
+                        base_sun_effect = 5.0
                     else:  # overcast
-                        relative_temp_f += 2
+                        base_sun_effect = 2.0
                 else:  # clear
-                    relative_temp_f += 10
+                    base_sun_effect = 10.0
             elif tod in (TimeOfDay.DAWN, TimeOfDay.DUSK):
                 if conditions.is_cloudy and conditions.is_light:
-                    relative_temp_f += 2
+                    base_sun_effect = 2.0
                 elif not conditions.is_cloudy:  # clear
-                    relative_temp_f += 5
-            # Night: no sun adjustment
+                    base_sun_effect = 5.0
+            # Night: base_sun_effect stays 0
+
+            # Apply sun altitude factor (reduces effect when sun is low)
+            if base_sun_effect > 0:
+                sun_altitude = (
+                    self.astronomical.sun_altitude_deg
+                    if self.astronomical
+                    else None
+                )
+                sun_factor = config.calculate_sun_factor(sun_altitude)
+
+                # Calculate actual sun effect with altitude factor
+                sun_effect = base_sun_effect * sun_factor
+
+                # Apply minimum effect if sun is above zero-effect threshold
+                if sun_factor > 0 and config.min_effect_when_visible > 0:
+                    sun_effect = max(sun_effect, config.min_effect_when_visible)
+
+                relative_temp_f += sun_effect
 
         return relative_temp_f
 
     def get_relative_temperature_c(
         self,
         time_of_day: TimeOfDay | None = None,
+        sun_config: SunEffectConfig | None = None,
     ) -> float:
         """Calculate relative/perceived temperature in Celsius.
 
         See get_relative_temperature_f for details.
         """
-        return (self.get_relative_temperature_f(time_of_day) - 32) * 5 / 9
+        return (self.get_relative_temperature_f(time_of_day, sun_config) - 32) * 5 / 9
 
 
 class Forecast(BaseModel):

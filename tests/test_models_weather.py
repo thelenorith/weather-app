@@ -8,9 +8,12 @@ from weather_events.models.location import Coordinates
 from weather_events.models.weather import (
     AstronomicalData,
     CloudCover,
+    ConditionFlags,
     Forecast,
     HourlyForecast,
     Precipitation,
+    SunEffectConfig,
+    TimeOfDay,
     WeatherCondition,
     Wind,
 )
@@ -240,3 +243,218 @@ class TestForecast:
 
         results = sample_forecast.get_forecast_range(start, end)
         assert len(results) == 6  # 6 hours inclusive
+
+
+class TestConditionFlags:
+    """Tests for ConditionFlags parsing."""
+
+    def test_from_condition_clear(self):
+        """Test flags for clear condition."""
+        flags = ConditionFlags.from_condition(WeatherCondition.CLEAR)
+        assert not flags.is_rain
+        assert not flags.is_snow
+        assert not flags.is_cloudy
+        assert not flags.is_thunderstorm
+
+    def test_from_condition_rain(self):
+        """Test flags for rain conditions."""
+        flags = ConditionFlags.from_condition(WeatherCondition.RAIN)
+        assert flags.is_rain
+        assert not flags.is_light
+        assert not flags.is_heavy
+
+        light = ConditionFlags.from_condition(WeatherCondition.LIGHT_RAIN)
+        assert light.is_rain
+        assert light.is_light
+
+        heavy = ConditionFlags.from_condition(WeatherCondition.HEAVY_RAIN)
+        assert heavy.is_rain
+        assert heavy.is_heavy
+
+    def test_from_condition_snow(self):
+        """Test flags for snow conditions."""
+        flags = ConditionFlags.from_condition(WeatherCondition.SNOW)
+        assert flags.is_snow
+        assert not flags.is_rain
+
+    def test_from_condition_thunderstorm(self):
+        """Test flags for thunderstorm."""
+        flags = ConditionFlags.from_condition(WeatherCondition.THUNDERSTORM)
+        assert flags.is_thunderstorm
+        assert not flags.is_rain  # Thunderstorm is separate
+
+    def test_from_description(self):
+        """Test parsing from text description."""
+        flags = ConditionFlags.from_description("Chance of Light Rain")
+        assert flags.is_rain
+        assert flags.is_chance
+        assert flags.is_light
+
+        flags2 = ConditionFlags.from_description("Heavy Thunderstorms")
+        assert flags2.is_thunderstorm
+        assert flags2.is_heavy
+
+    def test_is_wet(self):
+        """Test wet condition detection."""
+        rain = ConditionFlags.from_condition(WeatherCondition.RAIN)
+        assert rain.is_wet()
+
+        clear = ConditionFlags.from_condition(WeatherCondition.CLEAR)
+        assert not clear.is_wet()
+
+
+class TestSunEffectConfig:
+    """Tests for sun effect configuration."""
+
+    def test_default_config(self):
+        """Test default configuration values."""
+        config = SunEffectConfig()
+        assert config.min_altitude_zero_effect == 10.0
+        assert config.min_altitude_full_effect == 45.0
+        assert config.min_effect_when_visible == 0.0
+
+    def test_sun_factor_below_zero(self):
+        """Test sun factor when below zero-effect threshold."""
+        config = SunEffectConfig(min_altitude_zero_effect=10, min_altitude_full_effect=45)
+        assert config.calculate_sun_factor(5) == 0.0
+        assert config.calculate_sun_factor(0) == 0.0
+        assert config.calculate_sun_factor(-10) == 0.0
+
+    def test_sun_factor_above_full(self):
+        """Test sun factor when above full-effect threshold."""
+        config = SunEffectConfig(min_altitude_zero_effect=10, min_altitude_full_effect=45)
+        assert config.calculate_sun_factor(45) == 1.0
+        assert config.calculate_sun_factor(60) == 1.0
+        assert config.calculate_sun_factor(90) == 1.0
+
+    def test_sun_factor_interpolation(self):
+        """Test linear interpolation between thresholds."""
+        config = SunEffectConfig(min_altitude_zero_effect=10, min_altitude_full_effect=45)
+
+        # Midpoint should be 0.5
+        midpoint = (10 + 45) / 2  # 27.5
+        assert config.calculate_sun_factor(midpoint) == pytest.approx(0.5)
+
+        # Quarter point
+        quarter = 10 + (45 - 10) * 0.25  # 18.75
+        assert config.calculate_sun_factor(quarter) == pytest.approx(0.25)
+
+    def test_sun_factor_none(self):
+        """Test sun factor with no altitude data (backward compatible)."""
+        config = SunEffectConfig()
+        assert config.calculate_sun_factor(None) == 1.0
+
+
+class TestRelativeTemperature:
+    """Tests for relative temperature calculation."""
+
+    def test_basic_relative_temp(self):
+        """Test basic relative temperature (no adjustments)."""
+        # Clear day, no wind - should get full sun effect
+        forecast = HourlyForecast(
+            time=datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc),
+            temperature_c=20.0,  # 68°F
+            condition=WeatherCondition.CLEAR,
+            astronomical=AstronomicalData(
+                sun_altitude_deg=60,
+                sunrise=datetime(2024, 6, 15, 6, 0, tzinfo=timezone.utc),
+                sunset=datetime(2024, 6, 15, 20, 0, tzinfo=timezone.utc),
+            ),
+        )
+        # 68°F + 10°F (clear day) = 78°F
+        relative = forecast.get_relative_temperature_f()
+        assert relative == pytest.approx(78.0)
+
+    def test_relative_temp_wind_adjustment(self):
+        """Test wind reduces relative temperature."""
+        forecast = HourlyForecast(
+            time=datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc),
+            temperature_c=20.0,  # 68°F
+            condition=WeatherCondition.CLEAR,
+            wind=Wind(speed_ms=4.47),  # ~10 mph
+            astronomical=AstronomicalData(
+                sun_altitude_deg=60,
+                sunrise=datetime(2024, 6, 15, 6, 0, tzinfo=timezone.utc),
+                sunset=datetime(2024, 6, 15, 20, 0, tzinfo=timezone.utc),
+            ),
+        )
+        # 68°F - 9°F (wind, max) + 10°F (sun) = 69°F
+        relative = forecast.get_relative_temperature_f()
+        # Wind is ~10 mph, capped at 9°F reduction
+        assert relative < 78.0  # Less than no-wind case
+
+    def test_relative_temp_rain_adjustment(self):
+        """Test rain reduces relative temperature."""
+        forecast = HourlyForecast(
+            time=datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc),
+            temperature_c=20.0,  # 68°F
+            condition=WeatherCondition.RAIN,
+            astronomical=AstronomicalData(
+                sun_altitude_deg=60,
+                sunrise=datetime(2024, 6, 15, 6, 0, tzinfo=timezone.utc),
+                sunset=datetime(2024, 6, 15, 20, 0, tzinfo=timezone.utc),
+            ),
+        )
+        # 68°F - 7°F (rain) + 0°F (wet=no sun effect) = 61°F
+        relative = forecast.get_relative_temperature_f()
+        assert relative == pytest.approx(61.0)
+
+    def test_relative_temp_low_sun(self):
+        """Test low sun altitude reduces warming effect."""
+        # High sun
+        high_sun = HourlyForecast(
+            time=datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc),
+            temperature_c=20.0,
+            condition=WeatherCondition.CLEAR,
+            astronomical=AstronomicalData(
+                sun_altitude_deg=60,
+                sunrise=datetime(2024, 6, 15, 6, 0, tzinfo=timezone.utc),
+                sunset=datetime(2024, 6, 15, 20, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+        # Low sun (winter-like)
+        low_sun = HourlyForecast(
+            time=datetime(2024, 12, 15, 12, 0, tzinfo=timezone.utc),
+            temperature_c=20.0,
+            condition=WeatherCondition.CLEAR,
+            astronomical=AstronomicalData(
+                sun_altitude_deg=20,  # Low winter sun
+                sunrise=datetime(2024, 12, 15, 7, 0, tzinfo=timezone.utc),
+                sunset=datetime(2024, 12, 15, 17, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+        high_relative = high_sun.get_relative_temperature_f()
+        low_relative = low_sun.get_relative_temperature_f()
+
+        # Low sun should have less warming effect
+        assert low_relative < high_relative
+
+    def test_relative_temp_custom_sun_config(self):
+        """Test relative temperature with custom sun configuration."""
+        forecast = HourlyForecast(
+            time=datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc),
+            temperature_c=20.0,  # 68°F
+            condition=WeatherCondition.CLEAR,
+            astronomical=AstronomicalData(
+                sun_altitude_deg=15,  # Low angle
+                sunrise=datetime(2024, 6, 15, 6, 0, tzinfo=timezone.utc),
+                sunset=datetime(2024, 6, 15, 20, 0, tzinfo=timezone.utc),
+            ),
+        )
+
+        # Wooded trail config - needs higher altitude for effect
+        wooded_config = SunEffectConfig(
+            min_altitude_zero_effect=20,  # Trees block until 20°
+            min_altitude_full_effect=50,
+        )
+
+        # With default config at 15°, some sun effect
+        default_temp = forecast.get_relative_temperature_f()
+
+        # With wooded config, sun below tree line = no effect
+        wooded_temp = forecast.get_relative_temperature_f(sun_config=wooded_config)
+
+        assert wooded_temp < default_temp
+        assert wooded_temp == 68.0  # Just base temp, no sun effect
