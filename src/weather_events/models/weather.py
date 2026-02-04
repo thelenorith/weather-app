@@ -33,6 +33,124 @@ class WeatherCondition(str, Enum):
     UNKNOWN = "unknown"
 
 
+class TimeOfDay(str, Enum):
+    """Time of day classification for relative temperature adjustments.
+
+    Used to adjust perceived temperature based on sun exposure.
+    Dawn/dusk are transitional periods with partial sun effect.
+    """
+
+    NIGHT = "night"  # Sun well below horizon, no warming effect
+    DAWN = "dawn"  # Approaching sunrise, slight warming
+    DAY = "day"  # Sun above horizon, full warming effect
+    DUSK = "dusk"  # After sunset, diminishing warmth
+
+
+class ConditionFlags(BaseModel):
+    """Parsed weather condition flags.
+
+    Used for clothing rules and relative temperature calculation.
+    Matches legacy system's condition parsing for consistency.
+    """
+
+    is_rain: bool = False
+    is_snow: bool = False
+    is_cloudy: bool = False
+    is_thunderstorm: bool = False
+    is_slight: bool = False  # "slight chance"
+    is_chance: bool = False  # "chance of" / "likely" / "isolated"
+    is_light: bool = False  # "light" / "partial" / "patches"
+    is_heavy: bool = False  # "heavy"
+
+    @classmethod
+    def from_condition(cls, condition: WeatherCondition) -> "ConditionFlags":
+        """Create flags from a WeatherCondition enum."""
+        flags = cls()
+
+        if condition == WeatherCondition.THUNDERSTORM:
+            flags.is_thunderstorm = True
+        elif condition in (
+            WeatherCondition.SNOW,
+            WeatherCondition.HEAVY_SNOW,
+            WeatherCondition.LIGHT_SNOW,
+            WeatherCondition.SLEET,
+            WeatherCondition.HAIL,
+        ):
+            flags.is_snow = True
+            if condition == WeatherCondition.HEAVY_SNOW:
+                flags.is_heavy = True
+            elif condition == WeatherCondition.LIGHT_SNOW:
+                flags.is_light = True
+        elif condition in (
+            WeatherCondition.RAIN,
+            WeatherCondition.HEAVY_RAIN,
+            WeatherCondition.LIGHT_RAIN,
+            WeatherCondition.DRIZZLE,
+        ):
+            flags.is_rain = True
+            if condition == WeatherCondition.HEAVY_RAIN:
+                flags.is_heavy = True
+            elif condition in (WeatherCondition.LIGHT_RAIN, WeatherCondition.DRIZZLE):
+                flags.is_light = True
+        elif condition in (
+            WeatherCondition.CLOUDY,
+            WeatherCondition.OVERCAST,
+            WeatherCondition.FOG,
+            WeatherCondition.PARTLY_CLOUDY,
+        ):
+            flags.is_cloudy = True
+            if condition == WeatherCondition.PARTLY_CLOUDY:
+                flags.is_light = True
+
+        return flags
+
+    @classmethod
+    def from_description(cls, description: str) -> "ConditionFlags":
+        """Parse condition flags from a text description.
+
+        Handles descriptions like "Chance of Light Rain" or "Partly Cloudy".
+        """
+        flags = cls()
+        desc_upper = description.upper()
+
+        # Parse modifiers
+        flags.is_slight = "SLIGHT CHANCE" in desc_upper
+        flags.is_chance = any(
+            x in desc_upper for x in ["CHANCE", "LIKELY", "ISOLATED"]
+        )
+        flags.is_light = any(
+            x in desc_upper for x in ["LIGHT", "PARTIAL", "PATCHES", "SHALLOW"]
+        )
+        flags.is_heavy = "HEAVY" in desc_upper
+
+        # Parse condition (order matters - worst first)
+        if "THUNDERSTORM" in desc_upper:
+            flags.is_thunderstorm = True
+        elif any(x in desc_upper for x in ["SNOW", "HAIL", "ICE", "SLEET"]):
+            flags.is_snow = True
+        elif "SQUALLS" in desc_upper:
+            flags.is_rain = True
+            flags.is_light = False
+            flags.is_heavy = True
+        elif any(x in desc_upper for x in ["RAIN", "SHOWERS"]):
+            flags.is_rain = True
+        elif "DRIZZLE" in desc_upper:
+            flags.is_rain = True
+            flags.is_light = True
+        elif any(x in desc_upper for x in ["FOG", "HAZE", "MIST"]):
+            flags.is_cloudy = True
+        elif "OVERCAST" in desc_upper:
+            flags.is_cloudy = True
+        elif any(x in desc_upper for x in ["CLOUDY", "CLOUDS"]):
+            flags.is_cloudy = True
+
+        return flags
+
+    def is_wet(self) -> bool:
+        """Check if conditions involve wetness (affects relative temp)."""
+        return self.is_rain or self.is_thunderstorm or self.is_snow
+
+
 class CloudCover(BaseModel):
     """Cloud cover information."""
 
@@ -240,6 +358,137 @@ class HourlyForecast(BaseModel):
     def dew_point_f(self) -> float | None:
         """Dew point in Fahrenheit."""
         return self.dew_point_c * 9 / 5 + 32 if self.dew_point_c else None
+
+    def get_time_of_day(
+        self,
+        dawn_minutes: int = 30,
+        dusk_minutes: int = 30,
+    ) -> TimeOfDay:
+        """Determine time of day classification.
+
+        Args:
+            dawn_minutes: Minutes before sunrise to consider as dawn
+            dusk_minutes: Minutes after sunset to consider as dusk
+
+        Returns:
+            TimeOfDay classification
+        """
+        if not self.astronomical:
+            # Default to day if no astronomical data
+            return TimeOfDay.DAY
+
+        sunrise = self.astronomical.sunrise
+        sunset = self.astronomical.sunset
+
+        if not sunrise or not sunset:
+            # Fall back to sun altitude if available
+            if self.astronomical.sun_altitude_deg is not None:
+                if self.astronomical.sun_altitude_deg < -6:
+                    return TimeOfDay.NIGHT
+                elif self.astronomical.sun_altitude_deg < 0:
+                    return TimeOfDay.DUSK  # or DAWN, hard to tell without times
+                else:
+                    return TimeOfDay.DAY
+            return TimeOfDay.DAY
+
+        from datetime import timedelta
+
+        dawn_start = sunrise - timedelta(minutes=dawn_minutes)
+        dusk_end = sunset + timedelta(minutes=dusk_minutes)
+
+        if self.time < dawn_start:
+            return TimeOfDay.NIGHT
+        elif self.time < sunrise:
+            return TimeOfDay.DAWN
+        elif self.time < sunset:
+            return TimeOfDay.DAY
+        elif self.time < dusk_end:
+            return TimeOfDay.DUSK
+        else:
+            return TimeOfDay.NIGHT
+
+    def get_condition_flags(self) -> ConditionFlags:
+        """Get parsed condition flags for this forecast."""
+        return ConditionFlags.from_condition(self.condition)
+
+    def get_relative_temperature_f(
+        self,
+        time_of_day: TimeOfDay | None = None,
+    ) -> float:
+        """Calculate relative/perceived temperature in Fahrenheit.
+
+        This is a custom calculation that adjusts actual temperature for:
+        - Precipitation effect (getting wet makes you colder)
+        - Wind chill (each mph reduces perceived temp)
+        - Sun exposure (being in sun during day warms you up)
+
+        This differs from "feels like" which only accounts for wind chill
+        and humidity. Relative temperature is more useful for activity planning.
+
+        Args:
+            time_of_day: Override time of day (auto-detected if None)
+
+        Returns:
+            Relative temperature in Fahrenheit
+        """
+        temp_f = self.temperature_f
+        conditions = self.get_condition_flags()
+        tod = time_of_day or self.get_time_of_day()
+        wind_mph = self.wind.speed_mph if self.wind else 0
+
+        # Start with actual temperature
+        relative_temp_f = temp_f
+
+        # Precipitation adjustments (getting wet makes you feel colder)
+        if not conditions.is_slight:
+            if conditions.is_thunderstorm:
+                if conditions.is_chance:
+                    relative_temp_f -= 4
+                else:
+                    relative_temp_f -= 10  # Same as heavy rain
+            elif conditions.is_rain:
+                if conditions.is_chance:
+                    relative_temp_f -= 3
+                elif conditions.is_light:
+                    relative_temp_f -= 4
+                elif conditions.is_heavy:
+                    relative_temp_f -= 10
+                else:
+                    relative_temp_f -= 7
+            elif conditions.is_snow:
+                relative_temp_f -= 3
+
+        # Wind adjustment: -1°F per mph, max -9°F
+        relative_temp_f -= min(9, wind_mph)
+
+        # Sun exposure adjustment (only if not wet)
+        if not conditions.is_wet():
+            if tod == TimeOfDay.DAY:
+                if conditions.is_cloudy:
+                    if conditions.is_light:  # partly cloudy
+                        relative_temp_f += 5
+                    else:  # overcast
+                        relative_temp_f += 2
+                else:  # clear
+                    relative_temp_f += 10
+            elif tod in (TimeOfDay.DAWN, TimeOfDay.DUSK):
+                if conditions.is_cloudy and conditions.is_light:
+                    relative_temp_f += 2
+                elif not conditions.is_cloudy:  # clear
+                    relative_temp_f += 5
+            # Night: no sun adjustment
+
+        return relative_temp_f
+
+    def get_relative_temperature_c(
+        self,
+        time_of_day: TimeOfDay | None = None,
+    ) -> float:
+        """Calculate relative/perceived temperature in Celsius.
+
+        See get_relative_temperature_f for details.
+        """
+        return (self.get_relative_temperature_f(time_of_day) - 32) * 5 / 9
 
 
 class Forecast(BaseModel):
